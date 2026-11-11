@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "failReason",
+    "emergencyLevel",
+    "suspectedDisease",
+    "confidence",
+    "animalType",
+    "detectedSymptoms",
+    "recommendedActions",
+    "steps"
+  ],
+  "properties": {
+    "status": { "type": "string", "enum": ["success", "fail"] },
+    "failReason": { "anyOf": [ { "type": "string" }, { "type": "null" } ] },
+    "emergencyLevel": { "type": "string", "enum": ["high", "middle", "low"] },
+    "suspectedDisease": { "type": "string" },
+    "confidence": { "type": "number" },
+    "animalType": { "type": "string" },
+    "detectedSymptoms": { "type": "array", "items": { "type": "string" } },
+    "recommendedActions": { "type": "array", "items": { "type": "string" } },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["description", "warning"],
+        "properties": {
+          "description": { "type": "string" },
+          "warning": { "type": "string" }
+        }
+      }
+    }
+  }
+}

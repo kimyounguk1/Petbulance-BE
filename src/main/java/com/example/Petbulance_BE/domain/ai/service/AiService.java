@@ -1,390 +1,398 @@
 package com.example.Petbulance_BE.domain.ai.service;
 
-import com.example.Petbulance_BE.domain.ai.dto.AiGeminiApiDto.*;
+import com.example.Petbulance_BE.domain.ai.config.AiProperties;
+import com.example.Petbulance_BE.domain.ai.dto.AiDiagnosisDto.DiagnosisAiOutput;
 import com.example.Petbulance_BE.domain.ai.dto.res.DiagnosisResDto;
 import com.example.Petbulance_BE.global.common.error.exception.CustomException;
 import com.example.Petbulance_BE.global.common.error.exception.ErrorCode;
+import com.example.Petbulance_BE.global.external.Deadline;
+import com.example.Petbulance_BE.global.external.ExternalFailures;
+import com.example.Petbulance_BE.global.external.claude.AiOutputException;
+import com.example.Petbulance_BE.global.external.claude.ClaudeClient;
+import com.example.Petbulance_BE.global.external.claude.ClaudeImage;
+import com.example.Petbulance_BE.global.external.claude.ClaudeStream;
+import com.example.Petbulance_BE.global.external.claude.PromptResources;
+import com.example.Petbulance_BE.global.external.claude.StreamCancelledException;
+import com.example.Petbulance_BE.global.external.claude.StreamingJsonFieldParser;
+import com.example.Petbulance_BE.global.external.exception.UpstreamRejectedException;
+import com.example.Petbulance_BE.global.external.exception.UpstreamTimeoutException;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.node.TextNode;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryRegistry;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
-import org.springframework.web.reactive.function.client.WebClient;
-import org.springframework.web.reactive.function.client.WebClientResponseException;
-import reactor.core.publisher.Flux;
-import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
-import reactor.util.retry.Retry;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.nio.charset.StandardCharsets;
-import java.time.Duration;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
+/**
+ * AI 진단: 사진(최대 3장) + 동물 종 + 증상 → Claude 한 번 호출 → 응급도, 의심 질환, 응급처치 단계.
+ *
+ * <p>설계 요점
+ * <ul>
+ *   <li>예전에는 Gemini(이미지 분석) → Vertex(진단) 두 번 호출했다. Claude 는 사진과 텍스트를 한 번에 받으므로 1회로 줄였다</li>
+ *   <li>스트리밍: 출력 JSON 을 조각으로 받으면서 필드가 완성되는 즉시 사용자에게 보낸다 (응급도가 가장 먼저)</li>
+ *   <li>전용 스레드: Tomcat 스레드는 입력 검사 후 바로 반환되고, 진단은 AI 전용 스레드풀에서 돈다. 풀이 차면 즉시 503</li>
+ *   <li>재시도는 스트림을 열기 전(아무것도 보내기 전)에만 한다. 보내기 시작한 뒤에는 재시도하지 않는다</li>
+ *   <li>사용자가 떠나면 Claude 스트림을 바로 끊는다. "동물 사진이 아님" 판정도 나오는 즉시 끊어 토큰을 아낀다</li>
+ *   <li>모델 출력은 외부 입력이다: 스키마로 형식을 고정하고, 서버에서 값(응급도, 신뢰도, 단계)을 다시 검증한다</li>
+ * </ul>
+ */
 @Service
 @Slf4j
 public class AiService {
 
-    private final WebClient webClient;
-    private final String urlWithKey;
+    static final String CIRCUIT = "claude";
+    private static final Set<String> ALLOWED_IMAGE_TYPES = Set.of("image/jpeg", "image/png", "image/gif", "image/webp");
+    private static final Set<String> EMERGENCY_LEVELS = Set.of("high", "middle", "low");
+
+    private final ClaudeClient claudeClient;
     private final ObjectMapper objectMapper;
-    private final String genimiApiUrl;
+    private final AiProperties aiProperties;
+    private final ExecutorService aiStreamExecutor;
+    private final CircuitBreakerRegistry circuitBreakerRegistry;
+    private final RetryRegistry retryRegistry;
+    private final String systemPrompt;
+    private final JsonNode outputSchema;
 
-    public AiService(@Value("${rag.vertex.url-with-key}") String urlWithKey,
-                     WebClient webClient,
+    public AiService(ClaudeClient claudeClient,
                      ObjectMapper objectMapper,
-                     @Value("${gemini.api.url-with-key}") String genimiApiUrl) {
-        this.urlWithKey = urlWithKey;
-        this.webClient = webClient;
+                     AiProperties aiProperties,
+                     @Qualifier("aiStreamExecutor") ExecutorService aiStreamExecutor,
+                     CircuitBreakerRegistry circuitBreakerRegistry,
+                     RetryRegistry retryRegistry) {
+        this.claudeClient = claudeClient;
         this.objectMapper = objectMapper;
-        this.genimiApiUrl = genimiApiUrl;
+        this.aiProperties = aiProperties;
+        this.aiStreamExecutor = aiStreamExecutor;
+        this.circuitBreakerRegistry = circuitBreakerRegistry;
+        this.retryRegistry = retryRegistry;
+        this.systemPrompt = PromptResources.text("ai/diagnosis-system-prompt.txt");
+        this.outputSchema = PromptResources.json(objectMapper, "ai/diagnosis-schema.json");
     }
 
-    public Mono<String> encodeBase64Streaming(MultipartFile image) {
-        return Mono.fromCallable(() -> {
-            Base64.Encoder encoder = Base64.getEncoder();
+    // ================================================================ 진입점
 
-            InputStream inputStream = image.getInputStream();
-            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-            OutputStream base64Stream = encoder.wrap(outputStream); //oustputStream에 적히는 값을 base64로 암호화
+    /** SSE 스트리밍 진단. 입력 오류도 error 이벤트로 보낸다 (SSE 클라이언트가 한 가지 방식으로만 처리하도록) */
+    public SseEmitter aiDiagnosisStream(List<MultipartFile> images, String animalType, String symptom) {
+        SseEmitter emitter = new SseEmitter(aiProperties.flowDeadline().plusSeconds(5).toMillis());
+        SseDiagnosisListener listener = new SseDiagnosisListener(emitter);
+        emitter.onTimeout(listener::cancel);
+        emitter.onError(e -> listener.cancel());
+        emitter.onCompletion(listener::cancel);
 
-            byte[] buffer = new byte[8192]; // 8KB chunk
-            int bytesRead;
-            while ((bytesRead = inputStream.read(buffer)) != -1) {
-                base64Stream.write(buffer, 0, bytesRead);
-            }
-
-            base64Stream.flush();
-            inputStream.close();
-            base64Stream.close();
-
-            return outputStream.toString(StandardCharsets.UTF_8);
-        });
+        try {
+            DiagnosisInput input = prepare(images, animalType, symptom);
+            aiStreamExecutor.execute(() -> runDiagnosis(input, listener));
+        } catch (CustomException e) {
+            listener.onError(e);
+        } catch (RejectedExecutionException e) {
+            log.warn("AI 진단 전용 스레드가 모두 사용 중");
+            listener.onError(new CustomException(ErrorCode.AI_UNAVAILABLE));
+        }
+        return emitter;
     }
 
-    public Mono<String> encodeBase64Direct(MultipartFile image) {
-        return Mono.fromCallable(() -> {
-            // 1. 이미지 전체 바이트를 메모리에 한꺼번에 로드 (위험!)
-            byte[] imageBytes = image.getBytes();
+    /** 기존 JSON API. 같은 진단 로직을 전용 스레드에서 돌리고 결과만 모아 반환한다 (앱 계약 유지) */
+    public DiagnosisResDto aiDiagnosisProcess(List<MultipartFile> images, String animalType, String symptom) {
+        DiagnosisInput input = prepare(images, animalType, symptom);
+        CollectingDiagnosisListener listener = new CollectingDiagnosisListener();
 
-            // 2. 메모리에 있는 바이트 배열을 기반으로 인코딩 수행
-            // 원본 배열(1.0) + 인코딩 결과 문자열(1.3) = 최소 2.3배의 메모리 점유
-            return Base64.getEncoder().encodeToString(imageBytes);
-        });
-    }
-
-
-    // [재시도 전략 정의]: 에러 발생 시 2초 대기 후 1회 재시도 (최대 2번 실행됨)
-    private final Retry retrySpec = Retry.backoff(1, Duration.ofSeconds(2))
-            .filter(throwable -> {
-                // 4xx 에러(Bad Request)는 재시도해도 똑같으므로 재시도 안 함
-                if (throwable instanceof WebClientResponseException e) {
-                    return e.getStatusCode().is5xxServerError();
-                }
-                // 그 외 네트워크 오류, 파싱 오류 등은 재시도
-                return true;
-            })
-            .onRetryExhaustedThrow((retryBackoffSpec, retrySignal) -> {
-                // 재시도까지 다 실패하면 발생하는 예외
-                return new CustomException(ErrorCode.GEMINI_API_CONNECTION_ERROR);
-            });
-
-
-    public Mono<DiagnosisResDto> aiDiagnosisProcess(List<MultipartFile> images, String animalTypes, String symptoms) {
-
-        boolean hasImage = images != null && !images.isEmpty() && !images.get(0).isEmpty();
-
-        String animalType = (animalTypes == null) ? "입력없음" : animalTypes;
-        String symptom = (symptoms == null) ? "입력없음" : symptoms;
-
-        Mono<List<ExtractedData>> imageAnalysisMono;
-
-        if (hasImage) {
-            log.info("이미지 발견: 1차 이미지 분석 수행");
-            log.info("이미지 인코딩 정보 {}", images);
-
-            imageAnalysisMono = Flux.fromIterable(images)
-                    .flatMap(image -> encodeBase64Streaming(image)
-                            .subscribeOn(Schedulers.boundedElastic()) //전용 스레드풀로 옮겨 비동기 유지
-                            .flatMap(base64 -> {
-
-                                List<Part> parts = new ArrayList<>();
-                                String prompt = String.format(
-                                        "당신은 동물 진단 전문가입니다. 아래 규칙을 따라 동물 이미지의 증상을 분석하고, 오직 JSON 형식으로 응답하세요.\n" +
-                                        "입력 동물 타입: %s\n\n" +
-                                        "규칙:\n" +
-                                        "1. 입력 동물 타입이 \"입력없음\"이면, 이미지만 분석하여 가장 유력한 증상과 동물종을 판별합니다.\n" +
-                                        "   반환 형식: {\"status\": \"success\", \"data\": {\"description\": \"...\", \"confidence\": ..., \"animalType\": \"...\"}}\n" +
-                                        "2. 이미지가 동물이 아니면, {\"status\": \"fail\", \"message\": \"동물 이미지가 아닙니다.\"} 반환\n" +
-                                        "3. 입력된 animalType이 \"입력없음\"이 아니고 이미지가 일치하지 않으면, {\"status\": \"fail\", \"message\": \"이미지와 입력된 동물 종이 일치하지 않습니다.\"} 반환\n" +
-                                        "4. 이미지가 올바른 동물이고, animalType과 일치하면, {\"status\": \"success\", \"data\": {\"description\": \"...\", \"confidence\": ..., \"animalType\": \"...\"}} 반환\n" +
-                                        "5. JSON 외 다른 텍스트는 절대 출력하지 마세요.", animalType );
-
-                                parts.add(new Part(prompt, null));
-                                parts.add(new Part(null, new InlineData(image.getContentType(), base64)));
-
-                                Content content = new Content(parts);
-                                GeminiRequest geminiRequest = new GeminiRequest(List.of(content));
-
-                                return webClient.post()
-                                        .uri(genimiApiUrl)
-                                        .bodyValue(geminiRequest)
-                                        .retrieve()
-                                        .bodyToMono(GeminiResponse.class)
-                                        .retryWhen(retrySpec)
-                                        .flatMap(resp -> {
-                                            try {
-                                                String jsonString = resp.candidates().get(0)
-                                                        .content().parts().get(0).text()
-                                                        .replace("```json", "")
-                                                        .replace("```", "")
-                                                        .trim();
-
-                                                GeminiJsonOutput output = objectMapper.readValue(
-                                                        jsonString, GeminiJsonOutput.class);
-
-                                                if ("success".equals(output.status())) {
-                                                    return Mono.just(output.data());
-                                                } else {
-                                                    return Mono.error(new CustomException(ErrorCode.BAD_IMAGE));
-                                                }
-                                            } catch (Exception e) {
-                                                return Mono.error(new CustomException(ErrorCode.TEXT_ERROR));
-                                            }
-                                        })
-                                        .onErrorMap(e -> (e instanceof CustomException) ? e :
-                                                new CustomException(ErrorCode.GEMINI_API_CONNECTION_ERROR));
-                            })
-                    )
-                    .collectList();
-            // Mono<List<ExtractedData>>
-
-        } else {
-            log.info("이미지 없음: 텍스트 기반 진단으로 바로 진행");
-            imageAnalysisMono = Mono.just(List.of(new ExtractedData(
-                    "사용자가 이미지를 제공하지 않았습니다. 텍스트 증상에만 의존하여 진단하세요.", 0.0,"없음"
-            )));
+        Future<?> future;
+        try {
+            future = aiStreamExecutor.submit(() -> runDiagnosis(input, listener));
+        } catch (RejectedExecutionException e) {
+            log.warn("AI 진단 전용 스레드가 모두 사용 중");
+            throw new CustomException(ErrorCode.AI_UNAVAILABLE);
         }
 
-        // [2단계] RAG 진단 수행
-        return imageAnalysisMono.flatMap(list -> {
-
-            ExtractedData firstOutputData = list.get(0);
-
-            String ragPrompt = String.format("""
-                            당신은 수의학 응급 진단 전문가입니다. 애완동물인 만큼 사람처럼 지칭할 필요는 없어. 감정은 절제하고 정확한 정보 전달을 목표로 해.
-                            
-                            [환자 정보]
-                            - 동물 종: %s
-                            - 보호자 호소 증상: %s
-                            - 이미지 분석 결과: %s
-                            
-                            위 정보를 바탕으로 Vertex AI 검색 결과(RAG)를 참고하여 정밀 진단을 내려주세요.
-                            반드시 무조건 절대로 아래 JSON 형식으로만 답변해야 합니다.
-                            totalSteps는 항상 5로 고정이고 steps로 다섯가지 단계별 응급처치 방법이 존재해야합니다.
-                            emergencyLevel은 "high", "middle", "low" 세가지 값중 하나만 지정될 수 있습니다.
-                            
-                            [필수 포함 항목]
-                            - confidence: 검색된 정보와 증상의 일치도를 바탕으로 진단 신뢰도(0.0 ~ 1.0)를 계산하여 포함하세요.
-                            
-                            [JSON 응답 예시]
-                            {
-                              "status": "success",
-                              "data": {
-                                "emergencyLevel": "high",
-                                "confidence": 0.85,
-                                "detectedSymptoms": ["개구 호흡", "비공 거품"],
-                                "suspectedDisease": "상부 호흡기 감염 의심",
-                                "recommendedActions": ["2시간 이내 전문의 진료 권장", "강제 급식 금지", "이동 중 보온 유지 필수"],
-                                "animalType": "%s",
-                                "totalSteps": 5,
-                                "steps": [
-                                  { "description": "...", "warning": "..." },
-                                  { "description": "...", "warning": "..." },
-                                  { "description": "...", "warning": "..." },
-                                  { "description": "...", "warning": "..." },
-                                  { "description": "...", "warning": "..." }
-                                ]
-                              },
-                              "message": null
-                            }
-                            """,
-                    firstOutputData.animalType(), symptom, firstOutputData.description(), firstOutputData.animalType());
-
-            Content2 ragContent = new Content2("user", List.of(new Part(ragPrompt, null)));
-            GeminiRequest2 geminiRequest2 = new GeminiRequest2(List.of(ragContent));
-
-            // [2차 API 호출]
-            return webClient.post()
-                    .uri(urlWithKey)
-                    .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
-                    .bodyValue(geminiRequest2)
-                    .retrieve()
-                    .bodyToMono(JsonNode.class)
-                    .retryWhen(retrySpec) // 1회 재시도 적용
-                    .map(node -> {
-                        try {
-                            String rawText = node.path("candidates").get(0)
-                                    .path("content").path("parts").get(0)
-                                    .path("text").asText()
-                                    .replace("```json", "")
-                                    .replace("```", "")
-                                    .trim();
-                            log.info("RAG Raw Text: {}", rawText);
-                            return rawText;
-                        } catch (Exception e) {
-                            // 구조가 다르면 재시도 (AI가 가끔 형식을 어길 때가 있음)
-                            throw new CustomException(ErrorCode.TEXT_ERROR);
-                        }
-                    })
-                    .flatMap(finalJsonString -> {
-                        try {
-                            FinalResponseDto finalRes = objectMapper.readValue(finalJsonString, FinalResponseDto.class);
-                            log.info("Final Parsed: {}", finalRes);
-
-                            if (!"success".equals(finalRes.status())) {
-                                log.error("RAG 진단 실패 메시지: {}", finalRes.message());
-                                return Mono.error(new CustomException(ErrorCode.AI_DIAGNOSIS_FAIL));
-                            }
-
-                            DiagnosisResDto diagnosisResDto = mapToDiagnosisResDto(finalRes.data());
-                            return Mono.just(diagnosisResDto);
-
-                        } catch (Exception e) {
-                            // JSON 파싱 에러 -> 재시도 대상
-                            return Mono.error(new CustomException(ErrorCode.TEXT_ERROR));
-                        }
-                    })
-                    // 2차 과정에서 발생한 에러를 CustomException으로 매핑
-                    .onErrorMap(e -> {
-                        if (e instanceof CustomException) return e; // 이미 CustomException이면 통과
-                        if (e instanceof JsonProcessingException || e.getMessage().contains("JSON")) {
-                            return new CustomException(ErrorCode.AI_RESPONSE_PARSING_ERROR);
-                        }
-                        log.error("2차 진단 중 알 수 없는 에러", e);
-                        return new CustomException(ErrorCode.AI_DIAGNOSIS_FAIL);
-                    });
-        });
+        try {
+            future.get(aiProperties.flowDeadline().plusSeconds(5).toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            listener.cancel();
+            throw new CustomException(ErrorCode.AI_UNAVAILABLE);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            listener.cancel();
+            throw new CustomException(ErrorCode.AI_UNAVAILABLE);
+        } catch (ExecutionException e) {
+            log.error("AI 진단 실행 중 예상치 못한 오류", e.getCause());
+            throw new CustomException(ErrorCode.AI_DIAGNOSIS_FAIL);
+        }
+        return listener.resultOrThrow();
     }
 
-    private DiagnosisResDto mapToDiagnosisResDto(FinalData data) {
+    // ================================================================ 입력
+
+    record DiagnosisInput(List<ClaudeImage> images, String userText) {
+    }
+
+    /** 요청 스레드에서 실행: 검증 + 이미지 인코딩 (멀티파트 파일은 요청이 끝나면 사라질 수 있어 미리 읽는다) */
+    DiagnosisInput prepare(List<MultipartFile> images, String animalType, String symptom) {
+        if (!aiProperties.isEnabled()) {
+            log.warn("AI 진단 비활성화 상태(킬스위치)");
+            throw new CustomException(ErrorCode.AI_UNAVAILABLE);
+        }
+
+        List<MultipartFile> files = images == null ? List.of()
+                : images.stream().filter(f -> f != null && !f.isEmpty()).toList();
+        if (files.size() > aiProperties.maxImages()) {
+            throw new CustomException(ErrorCode.AI_TOO_MANY_IMAGES,
+                    "AI 진단 이미지는 최대 " + aiProperties.maxImages() + "장까지 가능합니다.");
+        }
+
+        String animal = normalizeText(animalType, 50, "동물 종");
+        String symptoms = normalizeText(symptom, aiProperties.maxSymptomLength(), "증상");
+
+        List<ClaudeImage> encoded = new ArrayList<>();
+        for (MultipartFile file : files) {
+            String type = file.getContentType() == null ? "" : file.getContentType().toLowerCase(Locale.ROOT);
+            if (!ALLOWED_IMAGE_TYPES.contains(type) || file.getSize() > aiProperties.maxImageBytes()) {
+                throw new CustomException(ErrorCode.AI_INVALID_IMAGE);
+            }
+            try {
+                encoded.add(new ClaudeImage(type, Base64.getEncoder().encodeToString(file.getBytes())));
+            } catch (IOException e) {
+                throw new CustomException(ErrorCode.IMAGE_PROCESSING_ERROR);
+            }
+        }
+
+        // 사용자 입력은 태그로 감싸 "데이터"임을 분명히 한다 (프롬프트 인젝션 완화). 태그 탈출을 막기 위해 꺾쇠는 치환
+        String userText = "<animal_type>" + animal + "</animal_type>\n"
+                + "<symptoms>" + symptoms + "</symptoms>\n"
+                + "첨부 사진: " + encoded.size() + "장";
+        return new DiagnosisInput(encoded, userText);
+    }
+
+    private static String normalizeText(String value, int maxLength, String label) {
+        if (value == null || value.isBlank()) {
+            return "입력없음";
+        }
+        String trimmed = value.trim();
+        if (trimmed.length() > maxLength) {
+            throw new CustomException(ErrorCode.INVALID_REQUEST, label + "은(는) " + maxLength + "자 이하로 입력해주세요.");
+        }
+        return trimmed.replace('<', '＜').replace('>', '＞');
+    }
+
+    // ================================================================ 진단 실행 (전용 스레드)
+
+    /**
+     * 스트림은 수명이 길어서 어노테이션 대신 서킷을 직접 다룬다.
+     * 스트림 중간에 난 오류(과부하 등)까지 서킷에 반영하기 위해서다.
+     */
+    void runDiagnosis(DiagnosisInput input, DiagnosisListener listener) {
+        Deadline deadline = Deadline.after(aiProperties.flowDeadline());
+        CircuitBreaker circuitBreaker = circuitBreakerRegistry.circuitBreaker(CIRCUIT);
+        long start = System.nanoTime();
+        boolean permitted = false;
+
+        try {
+            circuitBreaker.acquirePermission(); // 열려 있으면 CallNotPermittedException
+            permitted = true;
+
+            ObjectNode body = claudeClient.buildRequest(systemPrompt, input.images(), input.userText(), outputSchema);
+            // 재시도는 여기(스트림을 여는 단계)에서만. 아직 사용자에게 아무것도 보내지 않았다
+            ClaudeStream stream = Retry.decorateSupplier(retryRegistry.retry(CIRCUIT),
+                    () -> claudeClient.openStream("diagnosis", body)).get();
+            listener.attach(stream);
+
+            StringBuilder fullText = new StringBuilder();
+            StreamingJsonFieldParser parser = new StreamingJsonFieldParser(
+                    objectMapper, Set.of("steps"), new FieldForwarder(listener));
+
+            ClaudeStream.StreamSummary summary = stream.read(chunk -> {
+                if (listener.isCancelled()) {
+                    throw new StreamCancelledException();
+                }
+                if (deadline.remaining().isZero()) {
+                    throw new UpstreamTimeoutException(CIRCUIT, "진단 흐름 deadline 초과", null);
+                }
+                fullText.append(chunk);
+                parser.feed(chunk);
+            });
+
+            circuitBreaker.onSuccess(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+            permitted = false;
+
+            AiOutputException.checkStopReason(summary.stopReason(), fullText);
+            listener.onResult(toValidatedResult(fullText.toString()));
+
+        } catch (NotAnimalImage e) {
+            // 모델이 정상적으로 "분석 불가"라고 답한 것: 상대 장애가 아니므로 성공으로 기록
+            if (permitted) {
+                circuitBreaker.onSuccess(System.nanoTime() - start, TimeUnit.NANOSECONDS);
+            }
+            listener.onError(new CustomException(ErrorCode.BAD_IMAGE, e.getMessage()));
+        } catch (StreamCancelledException e) {
+            if (permitted) {
+                circuitBreaker.releasePermission();
+            }
+            log.info("사용자 연결 종료로 Claude 스트림을 중단했습니다.");
+        } catch (RuntimeException e) {
+            if (permitted) {
+                // 기록 여부는 yml 의 recordExceptions/ignoreExceptions 가 판단한다
+                circuitBreaker.onError(System.nanoTime() - start, TimeUnit.NANOSECONDS, e);
+            }
+            listener.onError(translate(e));
+        } finally {
+            listener.detach();
+        }
+    }
+
+    /** 필드를 사용자에게 흘려보내면서, "동물 사진 아님" 판정은 나오는 즉시 스트림을 멈춘다 */
+    private static final class FieldForwarder implements StreamingJsonFieldParser.Handler {
+
+        private final DiagnosisListener listener;
+        private String status;
+
+        private FieldForwarder(DiagnosisListener listener) {
+            this.listener = listener;
+        }
+
+        @Override
+        public void onField(String name, JsonNode value) {
+            switch (name) {
+                case "status" -> status = value.asText();
+                case "failReason" -> {
+                    if ("fail".equalsIgnoreCase(status)) {
+                        throw new NotAnimalImage(value.isNull() || value.asText().isBlank()
+                                ? "분석할 수 없는 사진입니다." : value.asText());
+                    }
+                }
+                // 문서상 enum 값의 대소문자는 보장되지 않으므로 정규화해서 보낸다
+                case "emergencyLevel" -> listener.onField(name, TextNode.valueOf(value.asText().toLowerCase(Locale.ROOT)));
+                default -> listener.onField(name, value);
+            }
+        }
+
+        @Override
+        public void onArrayElement(String arrayName, int index, JsonNode value) {
+            listener.onStep(index, value);
+        }
+    }
+
+    /** 모델이 "동물 사진이 아님/종 불일치"로 판정함 */
+    private static final class NotAnimalImage extends RuntimeException {
+        private NotAnimalImage(String message) {
+            super(message);
+        }
+    }
+
+    // ================================================================ 출력 검증
+
+    /** 스키마로 형식은 보장되지만, 값의 의미(허용 값, 범위, 필수 내용)는 서버가 다시 확인한다 */
+    DiagnosisResDto toValidatedResult(String json) {
+        DiagnosisAiOutput out;
+        try {
+            out = objectMapper.readValue(json, DiagnosisAiOutput.class);
+        } catch (JsonProcessingException e) {
+            throw new AiOutputException(AiOutputException.Reason.INVALID_FORMAT, "진단 JSON 파싱 실패", e);
+        }
+        if (!"success".equalsIgnoreCase(out.status())) {
+            throw new NotAnimalImage(out.failReason() == null ? "분석할 수 없는 사진입니다." : out.failReason());
+        }
+
+        String level = out.emergencyLevel() == null ? "" : out.emergencyLevel().toLowerCase(Locale.ROOT);
+        if (!EMERGENCY_LEVELS.contains(level)) {
+            throw new AiOutputException(AiOutputException.Reason.INVALID_FORMAT, "허용되지 않은 응급도: " + level);
+        }
+        if (out.confidence() != null && (out.confidence() < 0 || out.confidence() > 1)) {
+            throw new AiOutputException(AiOutputException.Reason.INVALID_FORMAT, "신뢰도 범위 오류: " + out.confidence());
+        }
+        if (out.steps() == null || out.steps().isEmpty()) {
+            throw new AiOutputException(AiOutputException.Reason.INVALID_FORMAT, "응급처치 단계가 없습니다.");
+        }
+
         return DiagnosisResDto.builder()
-                .animalType(data.animalType())
-                .emergencyLevel(data.emergencyLevel())
-                .confidence(data.confidence())
-                .detectedSymptoms(data.detectedSymptoms())
-                .suspectedDisease(data.suspectedDisease())
-                .recommendedActions(data.recommendedActions())
-                .totalSteps(data.totalSteps())
-                .steps(data.steps())
+                .animalType(out.animalType())
+                .emergencyLevel(level)
+                .confidence(out.confidence())
+                .detectedSymptoms(out.detectedSymptoms())
+                .suspectedDisease(out.suspectedDisease())
+                .recommendedActions(out.recommendedActions())
+                .steps(out.steps())
+                .totalSteps(out.steps().size()) // 모델이 적은 개수가 아니라 실제 개수
                 .build();
     }
 
-    public Mono<DiagnosisResDto> aiDiagnosisProcess1(List<MultipartFile> images, String animalTypes, String symptoms) {
-
-        boolean hasImage = images != null && !images.isEmpty() && !images.get(0).isEmpty();
-        String animalType = (animalTypes == null) ? "입력없음" : animalTypes;
-        String symptom = (symptoms == null) ? "입력없음" : symptoms;
-
-        Mono<List<ExtractedData>> imageAnalysisMono;
-
-        if (hasImage) {
-            imageAnalysisMono = Flux.fromIterable(images)
-                    .flatMap(image -> encodeBase64Streaming(image) // 메모리 부하 로직은 유지
-                            .subscribeOn(Schedulers.boundedElastic())
-                            .flatMap(base64 -> {
-                                log.info("이미지 인코딩 완료 (길이: {}), 가짜 응답 반환", base64.length());
-
-                                // [수정] 외부 API 호출 대신 고정된 성공 데이터 반환
-                                return Mono.just(new ExtractedData(
-                                        "이미지 분석 결과 예시입니다. 눈에 충혈이 보입니다.",
-                                        0.95,
-                                        animalType
-                                ));
-                            })
-                    )
-                    .collectList();
-        } else {
-            imageAnalysisMono = Mono.just(List.of(new ExtractedData(
-                    "이미지 없음", 0.0, "없음"
-            )));
+    private CustomException translate(RuntimeException e) {
+        if (e instanceof CustomException custom) {
+            return custom;
         }
-
-        // [2단계] RAG 진단 수행 (여기도 Mock 처리)
-        return imageAnalysisMono.flatMap(list -> {
-            log.info("2차 RAG 단계 진입 (Mock)");
-
-            // [수정] 2차 외부 호출도 Mock 데이터로 즉시 반환
-            DiagnosisResDto mockResponse = DiagnosisResDto.builder()
-                    .animalType(animalType)
-                    .emergencyLevel("high")
-                    .detectedSymptoms(List.of("결막염", "안구 건조"))
-                    .suspectedDisease("안구 질환 의심")
-                    .totalSteps(5)
-                    .steps(new ArrayList<>()) // 필요시 dummy 데이터 추가
-                    .recommendedActions(List.of("인공눈물 투여", "병원 방문"))
-                    .confidence(0.88)
-                    .build();
-
-            return Mono.just(mockResponse);
-        });
+        if (e instanceof NotAnimalImage notAnimal) {
+            return new CustomException(ErrorCode.BAD_IMAGE, notAnimal.getMessage());
+        }
+        if (e instanceof AiOutputException output) {
+            log.warn("AI 출력 사용 불가 reason={}", output.getReason());
+            return switch (output.getReason()) {
+                case BLOCKED -> new CustomException(ErrorCode.AI_BLOCKED_CONTENT);
+                case INVALID_FORMAT -> new CustomException(ErrorCode.AI_RESPONSE_PARSING_ERROR);
+                case EMPTY, TRUNCATED -> new CustomException(ErrorCode.AI_DIAGNOSIS_FAIL);
+            };
+        }
+        if (e instanceof UpstreamRejectedException rejected) {
+            // 400/401/402/403: 키, 결제, 요청 형식 문제. 재시도해도 같으므로 운영자가 봐야 한다
+            log.error("Claude 호출 거부 status={} authError={}", rejected.getStatus(), rejected.isAuthError());
+            return new CustomException(ErrorCode.AI_UNAVAILABLE);
+        }
+        if (ExternalFailures.isUnavailable(e)) {
+            log.warn("Claude 일시 불가 cause={}", e.getClass().getSimpleName());
+            return new CustomException(ErrorCode.AI_UNAVAILABLE);
+        }
+        log.error("AI 진단 중 예상치 못한 오류", e);
+        return new CustomException(ErrorCode.AI_DIAGNOSIS_FAIL);
     }
 
-    public Mono<DiagnosisResDto> aiDiagnosisProcess2(List<MultipartFile> images, String animalTypes, String symptoms) {
+    // ================================================================ 부하 테스트용 목 (외부 호출 없음)
 
-        boolean hasImage = images != null && !images.isEmpty() && !images.get(0).isEmpty();
-        String animalType = (animalTypes == null) ? "입력없음" : animalTypes;
-        String symptom = (symptoms == null) ? "입력없음" : symptoms;
+    public DiagnosisResDto aiDiagnosisProcess1(List<MultipartFile> images, String animalTypes, String symptoms) {
+        return mockDiagnosis(images, animalTypes);
+    }
 
-        Mono<List<ExtractedData>> imageAnalysisMono;
+    public DiagnosisResDto aiDiagnosisProcess2(List<MultipartFile> images, String animalTypes, String symptoms) {
+        return mockDiagnosis(images, animalTypes);
+    }
 
-        if (hasImage) {
-            imageAnalysisMono = Flux.fromIterable(images)
-                    .flatMap(image -> encodeBase64Direct(image) // 메모리 부하 로직은 유지
-                            .subscribeOn(Schedulers.boundedElastic())
-                            .flatMap(base64 -> {
-                                log.info("이미지 인코딩 완료 (길이: {}), 가짜 응답 반환", base64.length());
-
-                                // [수정] 외부 API 호출 대신 고정된 성공 데이터 반환
-                                return Mono.just(new ExtractedData(
-                                        "이미지 분석 결과 예시입니다. 눈에 충혈이 보입니다.",
-                                        0.95,
-                                        animalType
-                                ));
-                            })
-                    )
-                    .collectList();
-        } else {
-            imageAnalysisMono = Mono.just(List.of(new ExtractedData(
-                    "이미지 없음", 0.0, "없음"
-            )));
+    private DiagnosisResDto mockDiagnosis(List<MultipartFile> images, String animalTypes) {
+        if (images != null) {
+            for (MultipartFile image : images) {
+                try {
+                    log.info("이미지 인코딩 완료 (길이: {}), 가짜 응답 반환",
+                            Base64.getEncoder().encodeToString(image.getBytes()).length());
+                } catch (IOException e) {
+                    throw new CustomException(ErrorCode.IMAGE_PROCESSING_ERROR);
+                }
+            }
         }
-
-        // [2단계] RAG 진단 수행 (여기도 Mock 처리)
-        return imageAnalysisMono.flatMap(list -> {
-            log.info("2차 RAG 단계 진입 (Mock)");
-
-            // [수정] 2차 외부 호출도 Mock 데이터로 즉시 반환
-            DiagnosisResDto mockResponse = DiagnosisResDto.builder()
-                    .animalType(animalType)
-                    .emergencyLevel("high")
-                    .detectedSymptoms(List.of("결막염", "안구 건조"))
-                    .suspectedDisease("안구 질환 의심")
-                    .totalSteps(5)
-                    .steps(new ArrayList<>()) // 필요시 dummy 데이터 추가
-                    .recommendedActions(List.of("인공눈물 투여", "병원 방문"))
-                    .confidence(0.88)
-                    .build();
-
-            return Mono.just(mockResponse);
-        });
+        return DiagnosisResDto.builder()
+                .animalType(animalTypes == null ? "입력없음" : animalTypes)
+                .emergencyLevel("high")
+                .detectedSymptoms(List.of("결막염", "안구 건조"))
+                .suspectedDisease("안구 질환 의심")
+                .totalSteps(0)
+                .steps(new ArrayList<>())
+                .recommendedActions(List.of("인공눈물 투여", "병원 방문"))
+                .confidence(0.88)
+                .build();
     }
 }
