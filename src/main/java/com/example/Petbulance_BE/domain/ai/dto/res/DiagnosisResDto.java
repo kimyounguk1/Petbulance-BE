@@ -1,6 +1,6 @@
 package com.example.Petbulance_BE.domain.ai.dto.res;
 
-import com.example.Petbulance_BE.domain.ai.dto.AiGeminiApiDto;
+import com.example.Petbulance_BE.domain.ai.dto.AiDiagnosisDto;
 import lombok.*;
 
 import java.util.List;
@@ -22,7 +22,7 @@ public class DiagnosisResDto {
 
     private Integer totalSteps;
 
-    private List<AiGeminiApiDto.Step> steps;
+    private List<AiDiagnosisDto.Step> steps;
 
     private List<String> recommendedActions;
 

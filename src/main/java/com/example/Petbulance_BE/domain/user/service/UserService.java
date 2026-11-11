@@ -28,7 +28,8 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.client.RestTemplate;
+import org.springframework.transaction.support.TransactionTemplate;
+import com.example.Petbulance_BE.global.external.oauth.OAuthEmailResolver;
 
 import java.net.URL;
 import java.util.*;
@@ -39,7 +40,8 @@ import java.util.*;
 public class UserService {
 
     private final UsersJpaRepository usersJpaRepository;
-    private final RestTemplate restTemplate = new RestTemplate();
+    private final OAuthEmailResolver oauthEmailResolver;
+    private final TransactionTemplate transactionTemplate;
     private final UserEmailsJpaRepository userEmailsJpaRepository;
     private final S3Service s3Service;
     private final JWTUtil jwtUtil;
@@ -79,19 +81,19 @@ public class UserService {
                 .build();
     }
 
-    @Transactional
+    /**
+     * 소셜 서버 호출(외부 HTTP)은 트랜잭션 밖에서 하고, DB 갱신만 짧은 트랜잭션으로 묶는다.
+     * 예전에는 메서드 전체가 트랜잭션이라 소셜 서버가 느리면 DB 커넥션을 쥔 채 대기했다.
+     */
     public SocialConnectResponseDto socialConnectProcess(SocialConnectRequestDto socialConnectRequestDto) {
 
         String provider = socialConnectRequestDto.getProvider();
+        String email = oauthEmailResolver.resolveEmail(provider, socialConnectRequestDto.getAuthCode());
 
-        String email;
+        return transactionTemplate.execute(status -> connectSocialAccount(provider, email));
+    }
 
-        switch (provider) {
-            case "KAKAO" -> email = getKakaoEmail(socialConnectRequestDto.getAuthCode());
-            case "NAVER" -> email = getNaverEmail(socialConnectRequestDto.getAuthCode());
-            case "GOOGLE" -> email = getGoogleEmail(socialConnectRequestDto.getAuthCode());
-            default -> throw new CustomException(ErrorCode.INVALID_PROVIDER);
-        }
+    private SocialConnectResponseDto connectSocialAccount(String provider, String email) {
 
         Users currentUser = UserUtil.getCurrentUser();
 
@@ -121,64 +123,6 @@ public class UserService {
 
         return new SocialConnectResponseDto("계정이 성공적으로 연결되었습니다.");
 
-    }
-
-    private String getKakaoEmail(String accessToken) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.add("Authorization", "Bearer " + accessToken);
-        headers.add("Content-type", "application/x-www-form-urlencoded;charset=utf-8");
-
-        ResponseEntity<String> response = restTemplate.exchange(
-                "https://kapi.kakao.com/v2/user/me",
-                HttpMethod.POST,
-                new HttpEntity<>(headers),
-                String.class
-        );
-
-        try {
-            JsonNode node = new ObjectMapper().readTree(response.getBody());
-            return node.path("kakao_account").path("email").asText();
-        } catch (Exception e) {
-            throw new CustomException(ErrorCode.FAIL_KAKAO_LOGIN);
-        }
-    }
-
-    private String getNaverEmail(String accessToken) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.add("Authorization", "Bearer " + accessToken);
-
-        ResponseEntity<String> response = restTemplate.exchange(
-                "https://openapi.naver.com/v1/nid/me",
-                HttpMethod.GET,
-                new HttpEntity<>(headers),
-                String.class
-        );
-
-        try {
-            JsonNode node = new ObjectMapper().readTree(response.getBody());
-            return node.path("response").path("email").asText();
-        } catch (Exception e) {
-            throw new CustomException(ErrorCode.FAIL_NAVER_LOGIN);
-        }
-    }
-
-    private String getGoogleEmail(String accessToken) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.add("Authorization", "Bearer " + accessToken);
-
-        ResponseEntity<String> response = restTemplate.exchange(
-                "https://www.googleapis.com/oauth2/v2/userinfo",
-                HttpMethod.GET,
-                new HttpEntity<>(headers),
-                String.class
-        );
-
-        try {
-            JsonNode node = new ObjectMapper().readTree(response.getBody());
-            return node.path("email").asText();
-        } catch (Exception e) {
-            throw new CustomException(ErrorCode.FAIL_GOOGLE_LOGIN);
-        }
     }
 
     @Transactional
