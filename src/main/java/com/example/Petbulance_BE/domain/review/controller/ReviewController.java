@@ -18,7 +18,6 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
-import reactor.core.publisher.Mono;
 
 import java.util.List;
 import java.util.Map;
@@ -34,7 +33,7 @@ public class ReviewController {
 
     //영수증 리뷰 영수증 인식 기능
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public Mono<ReceiptResDto> receiptExtract(@RequestParam("image") MultipartFile image) {
+    public ReceiptResDto receiptExtract(@RequestParam("image") MultipartFile image) {
 
         if(image.isEmpty()){
             throw new CustomException(ErrorCode.NOT_FOUND_RECEIPT);

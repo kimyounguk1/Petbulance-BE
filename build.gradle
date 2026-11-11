@@ -92,8 +92,12 @@ dependencies {
 	testCompileOnly 'org.projectlombok:lombok'
 	testAnnotationProcessor 'org.projectlombok:lombok'
 
-	//webClient
-	implementation 'org.springframework.boot:spring-boot-starter-webflux'
+	// 외부 API 연동: RestClient + Apache HttpClient5(커넥션 풀 직접 제어), Resilience4j(재시도/서킷브레이커/벌크헤드)
+	// httpclient5 는 firebase-admin 의 전이 의존성으로 우연히 들어와 있었으므로 직접 선언한다 (버전은 Boot BOM 관리)
+	implementation 'org.apache.httpcomponents.client5:httpclient5'
+	implementation 'org.springframework.boot:spring-boot-starter-aop'
+	implementation 'io.github.resilience4j:resilience4j-spring-boot3:2.2.0'
+	testImplementation 'org.wiremock:wiremock-standalone:3.9.2'
 
 	implementation 'org.springframework.boot:spring-boot-starter-actuator'
 	implementation 'io.micrometer:micrometer-registry-prometheus'

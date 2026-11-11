@@ -98,7 +98,16 @@ public enum ErrorCode {
     FILE_NOT_FOUND(HttpStatus.NOT_FOUND, "S3에서 해당 파일을 찾을 수 없습니다."),
     NON_EXIST_TERMS(HttpStatus.BAD_REQUEST, "존재하지 않는 약관입니다."),
     ALREADY_REPORTED(HttpStatus.CONFLICT, "이미 접수된 신고입니다."),
-    ALREADY_COMPLETED(HttpStatus.BAD_REQUEST, "이미 처리 완료된 신고입니다.");
+    ALREADY_COMPLETED(HttpStatus.BAD_REQUEST, "이미 처리 완료된 신고입니다."),
+
+    // 외부 연동: 상대/네트워크 문제는 클라이언트 잘못이 아니므로 503 으로 응답한다
+    SOCIAL_LOGIN_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, "소셜 로그인 서버와의 통신이 원활하지 않습니다. 잠시 후 다시 시도해주세요."),
+    SOCIAL_EMAIL_NOT_PROVIDED(HttpStatus.BAD_REQUEST, "소셜 계정에서 이메일 정보를 받아오지 못했습니다. 이메일 제공에 동의해주세요."),
+    GEO_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, "주소 변환 서비스를 일시적으로 사용할 수 없습니다. 병원을 직접 검색해주세요."),
+    AI_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, "AI 서비스를 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해주세요."),
+    AI_BLOCKED_CONTENT(HttpStatus.BAD_REQUEST, "AI가 분석할 수 없는 입력입니다. 다른 이미지나 내용으로 시도해주세요."),
+    AI_TOO_MANY_IMAGES(HttpStatus.BAD_REQUEST, "AI 진단에 사용할 수 있는 이미지 수를 초과했습니다."),
+    AI_INVALID_IMAGE(HttpStatus.BAD_REQUEST, "AI 분석 이미지는 jpeg, png, gif, webp 형식이며 장당 용량 제한 이하여야 합니다.");
 
     private final HttpStatus status;
     private final String message;

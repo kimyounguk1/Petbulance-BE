@@ -15,19 +15,14 @@ import com.example.Petbulance_BE.global.common.error.exception.ErrorCode;
 import com.example.Petbulance_BE.global.common.redisEntity.RefreshEntity;
 import com.example.Petbulance_BE.global.common.redisRepository.RefreshTokenRepository;
 import com.example.Petbulance_BE.global.common.type.Role;
+import com.example.Petbulance_BE.global.external.oauth.OAuthEmailResolver;
 import com.example.Petbulance_BE.global.firebase.FirebaseTokenService;
 import com.example.Petbulance_BE.global.util.JWTUtil;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.firebase.auth.FirebaseAuthException;
 import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
-import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -43,21 +38,41 @@ public class AuthService {
     private final JWTUtil jwtUtil;
     private final RefreshTokenRepository refreshTokenRepository;
     private final FirebaseTokenService firebaseTokenService;
-    private final RestTemplate restTemplate = new RestTemplate();
+    private final OAuthEmailResolver oauthEmailResolver;
+    private final TransactionTemplate transactionTemplate;
     private final RandomNicknameGenerator randomNicknameGenerator;
     private final DashboardMetricRedisService dashboardMetricRedisService;
 
+    /**
+     * 클래스 전체에 트랜잭션이 걸려 있어서, 예전에는 소셜 서버 호출(외부 HTTP)이 DB 커넥션을 쥔 채 진행됐다.
+     * 소셜 서버가 느려지면 Hikari 풀이 말라 로그인과 무관한 기능까지 멈추므로 다음 순서로 나눈다.
+     * <ol>
+     *   <li>소셜 서버에서 이메일 조회 (트랜잭션 없음, 타임아웃/벌크헤드/서킷브레이커 적용)</li>
+     *   <li>사용자 조회/생성 (짧은 트랜잭션)</li>
+     *   <li>토큰 발급, Redis 저장, 가입 지표 (트랜잭션 없음, 커밋 이후)</li>
+     * </ol>
+     */
+    @Transactional(Transactional.TxType.NOT_SUPPORTED)
     public LoginResponseDto loginService(LoginRequestDto dto) {
         String provider = dto.getProvider().toUpperCase();
-        String email;
 
-        switch (provider) {
-            case "KAKAO" -> email = getKakaoEmail(dto.getAuthCode());
-            case "NAVER" -> email = getNaverEmail(dto.getAuthCode());
-            case "GOOGLE" -> email = getGoogleEmail(dto.getAuthCode());
-            default -> throw new CustomException(ErrorCode.INVALID_PROVIDER);
+        String email = oauthEmailResolver.resolveEmail(provider, dto.getAuthCode());
+
+        Authenticated authenticated = transactionTemplate.execute(status -> authenticate(provider, email));
+
+        if (authenticated.newUser()) {
+            dashboardMetricRedisService.incrementTodaySignup();
         }
 
+        LoginResponseDto response = createLoginResponse(authenticated.user(), provider);
+        response.setIsNewUser(authenticated.newUser());
+        return response;
+    }
+
+    private record Authenticated(Users user, boolean newUser) {
+    }
+
+    private Authenticated authenticate(String provider, String email) {
         final boolean[] isNewUser = {false};
 
         Users user = userEmailsJpaRepository.findByEmailByProvider(provider, email)
@@ -74,71 +89,7 @@ public class AuthService {
                     return createNewUser(provider, email);
                 });
 
-        if (isNewUser[0]) {
-            dashboardMetricRedisService.incrementTodaySignup();
-        }
-
-        LoginResponseDto response = createLoginResponse(user, provider);
-        response.setIsNewUser(isNewUser[0]);
-        return response;
-    }
-
-    private String getKakaoEmail(String accessToken) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.add("Authorization", "Bearer " + accessToken);
-        headers.add("Content-type", "application/x-www-form-urlencoded;charset=utf-8");
-
-        ResponseEntity<String> response = restTemplate.exchange(
-                "https://kapi.kakao.com/v2/user/me",
-                HttpMethod.POST,
-                new HttpEntity<>(headers),
-                String.class
-        );
-
-        try {
-            JsonNode node = new ObjectMapper().readTree(response.getBody());
-            return node.path("kakao_account").path("email").asText();
-        } catch (Exception e) {
-            throw new CustomException(ErrorCode.FAIL_KAKAO_LOGIN);
-        }
-    }
-
-    private String getNaverEmail(String accessToken) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.add("Authorization", "Bearer " + accessToken);
-
-        ResponseEntity<String> response = restTemplate.exchange(
-                "https://openapi.naver.com/v1/nid/me",
-                HttpMethod.GET,
-                new HttpEntity<>(headers),
-                String.class
-        );
-
-        try {
-            JsonNode node = new ObjectMapper().readTree(response.getBody());
-            return node.path("response").path("email").asText();
-        } catch (Exception e) {
-            throw new CustomException(ErrorCode.FAIL_NAVER_LOGIN);
-        }
-    }
-
-    private String getGoogleEmail(String accessToken) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.add("Authorization", "Bearer " + accessToken);
-
-        ResponseEntity<String> response = restTemplate.exchange(
-                "https://www.googleapis.com/oauth2/v2/userinfo",
-                HttpMethod.GET,
-                new HttpEntity<>(headers),
-                String.class
-        );
-
-        try {
-            JsonNode node = new ObjectMapper().readTree(response.getBody());
-            return node.path("email").asText();
-        } catch (Exception e) {
-            throw new CustomException(ErrorCode.FAIL_GOOGLE_LOGIN);
-        }
+        return new Authenticated(user, isNewUser[0]);
     }
 
     private Users createNewUser(String provider, String email) {
@@ -216,5 +167,3 @@ public class AuthService {
         return new LoginResponseDto(false, firebaseCustomToken, access, refresh);
     }
 }
-
-

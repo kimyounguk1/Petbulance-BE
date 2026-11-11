@@ -1,0 +1,35 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "failReason",
+    "storeName",
+    "items",
+    "totalAmount",
+    "address",
+    "addressType",
+    "paymentTime"
+  ],
+  "properties": {
+    "status": { "type": "string", "enum": ["success", "fail"] },
+    "failReason": { "anyOf": [ { "type": "string" }, { "type": "null" } ] },
+    "storeName": { "type": "string" },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "price"],
+        "properties": {
+          "name": { "type": "string" },
+          "price": { "type": "integer" }
+        }
+      }
+    },
+    "totalAmount": { "type": "integer" },
+    "address": { "type": "string" },
+    "addressType": { "type": "string", "enum": ["road", "parcel"] },
+    "paymentTime": { "type": "string" }
+  }
+}
