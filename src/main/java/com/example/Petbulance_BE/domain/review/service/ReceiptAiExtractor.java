@@ -9,6 +9,7 @@ import com.example.Petbulance_BE.global.external.ExternalFailures;
 import com.example.Petbulance_BE.global.external.claude.AiOutputException;
 import com.example.Petbulance_BE.global.external.claude.ClaudeClient;
 import com.example.Petbulance_BE.global.external.claude.ClaudeImage;
+import com.example.Petbulance_BE.global.external.claude.ImageEncoder;
 import com.example.Petbulance_BE.global.external.claude.ClaudeResult;
 import com.example.Petbulance_BE.global.external.claude.PromptResources;
 import com.example.Petbulance_BE.global.external.exception.UpstreamRejectedException;
@@ -95,7 +96,7 @@ public class ReceiptAiExtractor {
             throw new CustomException(ErrorCode.AI_INVALID_IMAGE);
         }
         try {
-            return new ClaudeImage(type, Base64.getEncoder().encodeToString(image.getBytes()));
+            return new ClaudeImage(type, ImageEncoder.encodeBase64Streaming(image));
         } catch (IOException e) {
             log.error("이미지 변환 실패");
             throw new CustomException(ErrorCode.FAIL_RECEIPT_EXTRACT);
