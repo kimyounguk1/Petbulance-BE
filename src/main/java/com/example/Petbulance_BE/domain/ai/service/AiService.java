@@ -10,6 +10,7 @@ import com.example.Petbulance_BE.global.external.ExternalFailures;
 import com.example.Petbulance_BE.global.external.claude.AiOutputException;
 import com.example.Petbulance_BE.global.external.claude.ClaudeClient;
 import com.example.Petbulance_BE.global.external.claude.ClaudeImage;
+import com.example.Petbulance_BE.global.external.claude.ImageEncoder;
 import com.example.Petbulance_BE.global.external.claude.ClaudeStream;
 import com.example.Petbulance_BE.global.external.claude.PromptResources;
 import com.example.Petbulance_BE.global.external.claude.StreamCancelledException;
@@ -170,7 +171,7 @@ public class AiService {
                 throw new CustomException(ErrorCode.AI_INVALID_IMAGE);
             }
             try {
-                encoded.add(new ClaudeImage(type, Base64.getEncoder().encodeToString(file.getBytes())));
+                encoded.add(new ClaudeImage(type, ImageEncoder.encodeBase64Streaming(file)));
             } catch (IOException e) {
                 throw new CustomException(ErrorCode.IMAGE_PROCESSING_ERROR);
             }
@@ -366,19 +367,20 @@ public class AiService {
     // ================================================================ 부하 테스트용 목 (외부 호출 없음)
 
     public DiagnosisResDto aiDiagnosisProcess1(List<MultipartFile> images, String animalTypes, String symptoms) {
-        return mockDiagnosis(images, animalTypes);
+        return mockDiagnosis(images, animalTypes, true);
     }
 
     public DiagnosisResDto aiDiagnosisProcess2(List<MultipartFile> images, String animalTypes, String symptoms) {
-        return mockDiagnosis(images, animalTypes);
+        return mockDiagnosis(images, animalTypes, false);
     }
 
-    private DiagnosisResDto mockDiagnosis(List<MultipartFile> images, String animalTypes) {
+    /** streaming=true: 나눠 읽기 변환, false: 한 번에 읽기 변환. 두 방식의 메모리 사용을 비교하는 부하 테스트용 */
+    private DiagnosisResDto mockDiagnosis(List<MultipartFile> images, String animalTypes, boolean streaming) {
         if (images != null) {
             for (MultipartFile image : images) {
                 try {
                     log.info("이미지 인코딩 완료 (길이: {}), 가짜 응답 반환",
-                            Base64.getEncoder().encodeToString(image.getBytes()).length());
+                            (streaming ? ImageEncoder.encodeBase64Streaming(image) : ImageEncoder.encodeBase64Direct(image)).length());
                 } catch (IOException e) {
                     throw new CustomException(ErrorCode.IMAGE_PROCESSING_ERROR);
                 }
